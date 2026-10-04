@@ -28,7 +28,7 @@ dependencies = [
     "google-auth>=2.49.1",
     "google-auth-oauthlib>=1.3.0",
     "html2text>=2024.2.26",
-    "jupyter-kernel-client",
+    "jupyter-kernel-client==0.9.0",
     "nbformat>=5.10.4",
     "packaging>=24.0",
     "prompt-toolkit>=3.0.52",
@@ -38,7 +38,7 @@ dependencies = [
     "rich>=14.3.3",
     "typer>=0.24.1",
     "typing-extensions>=4.0",
-    "websocket-client>=1.0",
+    "websocket-client>=1.6",
 ]
 
 [project.scripts]
@@ -57,11 +57,20 @@ build-backend = "hatchling.build"
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
+# Pin core metadata to 2.4: hatchling 1.32.0 defaults to 2.5, which our
+# publishing pipeline rejects with "'2.5' is not a valid metadata version",
+# silently failing the release. Drop this once 2.5 is accepted.
+core-metadata-version = "2.4"
 packages = ["src/colab_cli"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "README.md" = "colab_cli/README.md"
 "skills/colab-operator/SKILL.md" = "colab_cli/SKILL.md"
+
+[tool.hatch.build.targets.sdist]
+# The sdist is uploaded alongside the wheel and is validated separately, so it
+# needs the same pin.
+core-metadata-version = "2.4"
 
 [tool.uv]
 package = true

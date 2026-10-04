@@ -146,7 +146,7 @@ def _resolve_session(name: Optional[str]) -> SessionState:
     from colab_cli.common import state
 
     resolved = state.resolve_session(name)
-    s = state.store.get(resolved)
+    s = state.get_session(resolved, ignore_missing_session=True)
     if not s:
         typer.echo(
             f"[colab] session '{resolved}' not found. "
@@ -177,12 +177,15 @@ def _has_local_sessions() -> bool:
 
 
 def _auto_create_session(
-    gpu: Optional[str], tpu: Optional[str], name: Optional[str] = None
+    gpu: Optional[str],
+    tpu: Optional[str],
+    name: Optional[str] = None,
+    *,
+    high_mem: bool = False,
 ) -> SessionState:
     """Creates a runtime via ``colab new`` and returns its session.
 
-    Reuses ``colab new``'s creation path (assignment, keep-alive daemon, scope
-    pre-flight) verbatim so the two commands cannot drift.
+    Reuses ``colab new``'s creation path verbatim so the two commands cannot drift.
 
     Args:
       gpu: GPU accelerator to request, or None for CPU.
@@ -196,7 +199,7 @@ def _auto_create_session(
 
     name = name or uuid.uuid4().hex[:6]
     typer.echo(f"[colab] Creating runtime '{name}'...")
-    session_cmd.new(session=name, gpu=gpu, tpu=tpu)
+    session_cmd.new(session=name, gpu=gpu, tpu=tpu, high_mem=high_mem)
     return _resolve_session(name)
 
 
@@ -456,7 +459,11 @@ def _run_interactive_ssh(session: SessionState, identity: Optional[str]) -> int:
 
 
 def _select_proxy_session(
-    session: Optional[str], gpu: Optional[str], tpu: Optional[str]
+    session: Optional[str],
+    gpu: Optional[str],
+    tpu: Optional[str],
+    *,
+    high_mem: bool = False,
 ) -> tuple[SessionState, bool]:
     """Resolves (or creates) the session for ``--proxy-mode``.
 
@@ -475,12 +482,18 @@ def _select_proxy_session(
     """
     if session and not _session_exists(session):
         with contextlib.redirect_stdout(sys.stderr):
-            return _auto_create_session(gpu, tpu, name=session), True
+            return _auto_create_session(
+                gpu, tpu, name=session, high_mem=high_mem
+            ), True
     return _resolve_session(session), False
 
 
 def _select_interactive_session(
-    session: Optional[str], gpu: Optional[str], tpu: Optional[str]
+    session: Optional[str],
+    gpu: Optional[str],
+    tpu: Optional[str],
+    *,
+    high_mem: bool = False,
 ) -> tuple[SessionState, bool]:
     """Resolves (or auto-creates) the session for an interactive shell.
 
@@ -496,17 +509,22 @@ def _select_interactive_session(
       A ``(session_state, created)`` pair.
     """
     if not session and not _has_local_sessions():
-        return _auto_create_session(gpu, tpu), True
+        return _auto_create_session(gpu, tpu, high_mem=high_mem), True
     return _resolve_session(session), False
 
 
 def _warn_accelerator_ignored(
-    gpu: Optional[str], tpu: Optional[str], created: bool
+    gpu: Optional[str],
+    tpu: Optional[str],
+    created: bool,
+    *,
+    high_mem: bool = False,
 ) -> None:
-    """Warns that ``--gpu/--tpu`` are no-ops when no runtime was created."""
-    if (gpu or tpu) and not created:
+    """Warns that ``--gpu/--tpu/--high-mem`` are no-ops when no runtime was created."""
+    if (gpu or tpu or high_mem) and not created:
         typer.echo(
-            "[colab] --gpu/--tpu ignored: only applies to a created runtime.",
+            "[colab] --gpu/--tpu/--high-mem ignored: only applies to a "
+            "created runtime.",
             err=True,
         )
 
@@ -516,7 +534,7 @@ def _install_rm_signal_handlers(do_rm: Callable[[], None]) -> None:
 
     OpenSSH ends a ProxyCommand on disconnect by sending SIGHUP (not just
     stdin EOF); Python's default SIGHUP action would terminate us WITHOUT
-    running teardown, leaking the runtime and its keep-alive daemon. Convert
+    running teardown, leaking the runtime. Convert
     SIGHUP/SIGTERM/SIGINT into ``do_rm`` + ``os._exit`` so ``--rm`` teardown
     always runs.
 
@@ -647,6 +665,16 @@ def ssh(
             ),
         ),
     ] = None,
+    high_mem: Annotated[
+        bool,
+        typer.Option(
+            "--high-mem",
+            help=(
+                "Request a high-RAM machine shape when this command "
+                "auto-creates a runtime."
+            ),
+        ),
+    ] = False,
     rm: Annotated[
         bool,
         typer.Option(
@@ -669,12 +697,12 @@ def ssh(
     ``--gpu/--tpu`` set its accelerator, ``--rm`` stops it on disconnect).
     """
     if proxy_mode:
-        s, created = _select_proxy_session(session, gpu, tpu)
-        _warn_accelerator_ignored(gpu, tpu, created)
+        s, created = _select_proxy_session(session, gpu, tpu, high_mem=high_mem)
+        _warn_accelerator_ignored(gpu, tpu, created, high_mem=high_mem)
         raise typer.Exit(code=_run_proxy_bridge(s, identity, rm))
 
-    s, created = _select_interactive_session(session, gpu, tpu)
-    _warn_accelerator_ignored(gpu, tpu, created)
+    s, created = _select_interactive_session(session, gpu, tpu, high_mem=high_mem)
+    _warn_accelerator_ignored(gpu, tpu, created, high_mem=high_mem)
     raise typer.Exit(code=_run_interactive_shell(s, identity, created, rm))
 
 

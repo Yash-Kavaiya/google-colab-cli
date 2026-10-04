@@ -1,5 +1,7 @@
 ---
 log:
+2026-09-25: Cleaned up references to keep-alive background daemon and pre-flight pings. VM liveness is automatically maintained by the Colab backend based on active kernel activity.
+2026-08-10: Added `colab usage` for account-level compute-unit rate/balance via `GET /tun/m/ccu-info` on the session backend (same bearer token as `colab new`).
 2026-06-11: Replaced the `oauth2` provider's `run_local_server()` (localhost redirect) with a remote copy-paste flow (`_run_remote_flow` in `auth.py`). The CLI now prints an authorization URL built with `redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html` and `token_usage=remote`, then reads the pasted authorization code via `input()` and exchanges it with `flow.fetch_token(code=...)`. This is the same flow `gcloud auth application-default login` uses and works identically in local and remote/headless/container environments, removing the heuristic of whether to auto-open a browser. Confirmed server-side acceptance with a live GET-only check against the bundled cloud-SDK client (`764086051850-...`); the OOB redirect and a non-bundled client id were both verified to be rejected (`OOB flow has been blocked` / `redirect_uri_mismatch`). Unit tests in `tests/test_auth.py` assert no localhost server is started, the redirect URI + `token_usage=remote` are set, and the pasted code is exchanged.
 2026-06-01: Enabled `colab update --install` self-update on macOS in addition to Linux. Refactored platform check logic to keep the implementation DRY and updated both tests and documentation. Also, on these platforms, an additional message is shown recommending `colab update --install` to upgrade in place, positioned above the standard `pip`/`uv` installation command.
 2026-05-29: Added default OAuth2 client config (`oauth_config.json`) as a bundled package resource and restored fallback loading logic in `get_credentials()`. The CLI now falls back to using these default credentials when no explicit local config is found. Added `integration/repro_bundled_oauth` integration test.
@@ -12,7 +14,7 @@ log:
 2026-05-12: Added an optional `timeout=` parameter to `ColabRuntime.execute_code` that flows through to both the `execute()` and `execute_interactive()` branches. `colab auth` and `colab drivemount` now pass `timeout=600` (10 min) via a shared `INTERACTIVE_AUTOMATION_TIMEOUT_SEC` constant in `commands/automation.py`. Background: `jupyter_kernel_client` defaults to a 10s wall-clock timeout that is consumed even when the kernel is idle waiting on `input_request`. With the drivefs hook intercepting that request and prompting the user to OAuth in their browser, any user that takes >10s to click through (essentially everyone) hit `TimeoutError` and saw "drivemount failed" even though the mount had actually succeeded server-side. The fix is scoped narrowly to the two human-in-the-loop subcommands; non-interactive paths (`colab exec`, `colab run`, `colab install`, `colab repl --pipe`, `colab console --pipe`) keep the upstream default since they receive continuous iopub traffic that resets the practical inactivity ceiling.
 ---
 
-# Design: Automation and Utility (`auth`, `install`, `log`, `pay`, `version`, `update`, `whoami`)
+# Design: Automation and Utility (`auth`, `install`, `log`, `pay`, `usage`, `version`, `update`, `whoami`)
 
 ## Overview
 
@@ -57,17 +59,8 @@ allowing the core `Client` to remain authentication-agnostic — it only sees a
 ### Required Scopes
 
 The CLI talks to the Colab session backend at `colab.research.google.com`
-for assignment, unassignment, the contents API, **and keep-alive** (the TFE
-tunnel ping — see `01_session_management.md`). The `userinfo.email` scope is
+for assignment, unassignment, CCU info, and the contents API. The `userinfo.email` scope is
 sufficient for this host.
-
-> Historical note: keep-alive previously used the `RuntimeService`
-> (`KeepAliveAssignment`) at `colab.pa.googleapis.com`, which required the
-> `https://www.googleapis.com/auth/colaboratory` scope **and** the caller to
-> be a `serviceusage` consumer of Colab's internal project `1014160490159`.
-> The latter is impossible for ordinary user accounts, which made keep-alive
-> fail with HTTP 403 `USER_PROJECT_DENIED` for all external users (issue #14).
-> Keep-alive no longer touches `colab.pa.googleapis.com`.
 
 How each provider supplies the scope:
 
@@ -91,15 +84,11 @@ How each provider supplies the scope:
     ```
 
     `userinfo.email` is required for the session backend at
-    `colab.research.google.com` (otherwise assign/unassign/sessions/keep-alive
+    `colab.research.google.com` (otherwise assign/unassign/sessions
     return HTTP 401); `colaboratory` is retained for forward compatibility and
     other Colab features; `openid` and `cloud-platform` are mandated by
     `gcloud` itself (`gcloud auth application-default login` rejects scope
     lists that omit `cloud-platform` with `Invalid value for [--scopes]`).
-
-`colab new` performs a one-shot keep-alive pre-flight after `assign`
-succeeds so missing-scope failures surface immediately (with per-provider
-remediation guidance) rather than silently after ~1 minute via the daemon.
 
 ## Approach
 
@@ -151,13 +140,22 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
 -   **Conversion (Planned)**: Future expansion to convert history logs to
     `.ipynb` or `.html`.
 
-### 5. Subscription Management (`colab pay`)
+### 5. Compute-Unit Usage (`colab usage`)
+
+-   **Action**: Print account-level compute-unit (CU) usage rate and balance.
+-   **Data source**: `GET https://colab.research.google.com/tun/m/ccu-info`
+    (balance, hourly rate, assignment count). Same bearer token and session
+    backend as `colab new`.
+-   **Output**: `Current balance: … compute units`, `Usage rate: {rate}/hr`
+    (aggregate CU/hour across assigned VMs), `Active assignments: N`.
+
+### 6. Subscription Management (`colab pay`)
 
 -   **Action**: Open the Colab signup page in the user's browser.
 -   **Implementation**: Uses
     `webbrowser.open("https://colab.research.google.com/signup")`.
 
-### 6. Version Information (`colab version`)
+### 7. Version Information (`colab version`)
 
 -   **Action**: Show the current version of the Colab CLI.
 -   **Implementation**:
@@ -167,7 +165,7 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
         Git commit hash using `git rev-parse --short HEAD`.
     -   Dynamic versioning is supported in the build system via `hatch-vcs`.
 
-### 7. Auto-Update (`colab update`)
+### 8. Auto-Update (`colab update`)
 
 -   **Action**: Check if a new version of the Colab CLI is available.
 -   **Auto-check**: The CLI automatically checks for updates once every 24 hours
@@ -218,7 +216,7 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
     automation. If the upgrade command exits non-zero, `colab update --install`
     propagates the same exit code.
 
-### 8. Identity Inspection (`colab whoami`) [developer-only]
+### 9. Identity Inspection (`colab whoami`) [developer-only]
 
 -   **Action**: Resolve the active credentials, mint an access token, and
     print the email, audience, scopes, and expiry of that token.
@@ -260,7 +258,7 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
       - openid
     ```
 
-### 9. README and AGENT (`colab README`, `colab AGENT`)
+### 10. README and AGENT (`colab README`, `colab AGENT`)
 
 -   **Action**: Print the bundled `README.md` or `AGENTS.md` file.
 -   **Implementation**:

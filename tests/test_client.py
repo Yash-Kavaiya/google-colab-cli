@@ -16,7 +16,17 @@ import uuid
 import json
 import pytest
 from unittest.mock import MagicMock
-from colab_cli.client import Client, Prod, PostAssignmentResponse, Assignment
+from colab_cli.client import (
+    Client,
+    Prod,
+    PostAssignmentResponse,
+    Assignment,
+    Accelerator,
+    Shape,
+    TooManyAssignmentsError,
+    Variant,
+    resolve_assign_shape,
+)
 
 
 @pytest.fixture
@@ -65,6 +75,27 @@ def test_client_assign_new(client, mock_session):
     assert mock_session.request.call_count == 2
     last_call_args = mock_session.request.call_args_list[1]
     assert last_call_args.kwargs["headers"]["X-Goog-Colab-Token"] == "xsrf_token"
+
+
+def test_client_assign_412_raises_too_many_assignments(client, mock_session):
+    """A 412 on the POST /assign step should surface as
+    TooManyAssignmentsError, not the raw ColabRequestError."""
+    get_resp = MagicMock()
+    get_resp.ok = True
+    get_resp.text = ")]}'\n" + json.dumps(
+        {"acc": "NONE", "nbh": "some_nbh", "token": "xsrf_token", "variant": "DEFAULT"}
+    )
+
+    post_resp = MagicMock()
+    post_resp.ok = False
+    post_resp.status_code = 412
+    post_resp.reason = "Precondition Failed"
+    post_resp.text = "Precondition Failed"
+
+    mock_session.request.side_effect = [get_resp, post_resp]
+
+    with pytest.raises(TooManyAssignmentsError):
+        client.assign(uuid.uuid4())
 
 
 def test_client_unassign(client, mock_session):
@@ -146,91 +177,79 @@ def test_client_list_assignments(client, mock_session):
     assert "tun/m/assignments" in mock_session.request.call_args.args[1]
 
 
-def test_client_keep_alive_assignment_handles_empty_response(client, mock_session):
-    """The tunnel keep-alive ping returns an empty body. With no `schema=`,
-    _issue_request must short-circuit and not attempt to parse it."""
-    resp = MagicMock()
-    resp.ok = True
-    resp.text = ""
-    mock_session.request.return_value = resp
+def test_client_assign_url_includes_shape_hm(client, mock_session):
+    get_resp = MagicMock()
+    get_resp.ok = True
+    get_resp.text = ")]}'\n" + json.dumps(
+        {"acc": "NONE", "nbh": "some_nbh", "token": "xsrf_token", "variant": "DEFAULT"}
+    )
+    post_resp = MagicMock()
+    post_resp.ok = True
+    post_resp.text = ")]}'\n" + json.dumps(
+        {
+            "accelerator": "A100",
+            "endpoint": "new_endpoint",
+            "runtimeProxyInfo": {
+                "token": "proxy_token",
+                "tokenExpiresInSeconds": 3600,
+                "url": "http://backend",
+            },
+            "variant": 1,
+        }
+    )
+    mock_session.request.side_effect = [get_resp, post_resp]
 
-    # Should NOT raise.
-    result = client.keep_alive_assignment("m-s-test")
-    assert result is None  # no schema, so no return value
+    client.assign(
+        uuid.uuid4(),
+        variant=Variant.GPU,
+        accelerator=Accelerator.A100,
+        shape=Shape.HIGH_RAM,
+    )
 
-
-def test_client_keep_alive_assignment_request_shape(client, mock_session):
-    """Keep-alive is a Tunnel Frontend (TFE) HTTP ping, NOT the
-    `colab.pa.googleapis.com` RuntimeService RPC.
-
-    Background: the RuntimeService RPC requires the caller to be a
-    serviceusage consumer of Colab's internal project (1014160490159), which
-    no ordinary user account is. That path returned HTTP 403
-    USER_PROJECT_DENIED for every external user (issue #14). The official
-    Colab clients (and the colab-vscode extension) keep assignments alive via
-    a TFE-intercepted GET that only needs the user's own Gaia bearer token:
-
-        GET https://colab.research.google.com/tun/m/<endpoint>/keep-alive/
-        X-Colab-Tunnel: Google
-
-    TFE records LastActiveTime before forwarding, so the request keeps the VM
-    from being idle-pruned. This test pins that wire format.
-    """
-    resp = MagicMock()
-    resp.ok = True
-    resp.text = ""
-    mock_session.request.return_value = resp
-
-    client.keep_alive_assignment("m-s-test-endpoint")
-
-    assert mock_session.request.call_count == 1
-    call = mock_session.request.call_args
-    method, url = call.args[0], call.args[1]
-    headers = call.kwargs["headers"]
-
-    assert method == "GET"
-    # TFE tunnel keep-alive path on the session backend host.
-    assert url.endswith("/tun/m/m-s-test-endpoint/keep-alive/")
-    assert "colab.research.google.com" in url
-    # The request must be resolved through the Colab tunnel; without this
-    # header the front-door rejects the request with HTTP 400.
-    assert headers["X-Colab-Tunnel"] == "Google"
-    # Must NOT hit the RuntimeService / pa.googleapis.com path anymore.
-    assert "pa.googleapis.com" not in url
-    assert "KeepAliveAssignment" not in url
-    # No fire-and-forget JSON body; this is a plain GET.
-    assert "json" not in call.kwargs
-    # A short timeout is supplied so the daemon stays responsive on its cadence.
-    assert call.kwargs.get("timeout") is not None
+    get_url = mock_session.request.call_args_list[0].args[1]
+    assert "shape=hm" in get_url
+    post_url = mock_session.request.call_args_list[1].args[1]
+    assert "shape=hm" in post_url
 
 
-def test_client_keep_alive_assignment_treats_read_timeout_as_success(
-    client, mock_session
-):
-    """TFE records activity as soon as the request arrives, then forwards to a
-    VM that may not respond — so the request commonly read-times-out even
-    though the keep-alive succeeded. A ReadTimeout must NOT propagate as an
-    error (otherwise the daemon would log spurious keep_alive_error events)."""
-    import requests
+def test_client_assign_url_omits_shape_for_standard(client, mock_session):
+    get_resp = MagicMock()
+    get_resp.ok = True
+    get_resp.text = ")]}'\n" + json.dumps(
+        {"acc": "NONE", "nbh": "some_nbh", "token": "xsrf_token", "variant": "DEFAULT"}
+    )
+    post_resp = MagicMock()
+    post_resp.ok = True
+    post_resp.text = ")]}'\n" + json.dumps(
+        {
+            "accelerator": "NONE",
+            "endpoint": "new_endpoint",
+            "runtimeProxyInfo": {
+                "token": "proxy_token",
+                "tokenExpiresInSeconds": 3600,
+                "url": "http://backend",
+            },
+            "variant": 0,
+        }
+    )
+    mock_session.request.side_effect = [get_resp, post_resp]
 
-    mock_session.request.side_effect = requests.exceptions.ReadTimeout("timed out")
+    client.assign(uuid.uuid4())
 
-    # Should NOT raise.
-    result = client.keep_alive_assignment("m-s-test-endpoint")
-    assert result is None
+    get_url = mock_session.request.call_args_list[0].args[1]
+    assert "shape=" not in get_url
 
 
-def test_client_keep_alive_assignment_propagates_http_error(client, mock_session):
-    """A genuine HTTP error (e.g. 404 for a deleted assignment) must still
-    surface so the daemon can react (e.g. stop after consecutive 4xx)."""
-    from colab_cli.client import ColabRequestError
-
-    resp = MagicMock()
-    resp.ok = False
-    resp.status_code = 404
-    resp.reason = "Not Found"
-    resp.text = "gone"
-    mock_session.request.return_value = resp
-
-    with pytest.raises(ColabRequestError):
-        client.keep_alive_assignment("m-s-test-endpoint")
+@pytest.mark.parametrize(
+    "accelerator,high_mem,expected",
+    [
+        (Accelerator.T4, True, Shape.HIGH_RAM),
+        (Accelerator.A100, True, Shape.HIGH_RAM),
+        (Accelerator.NONE, True, Shape.HIGH_RAM),
+        (Accelerator.L4, True, None),
+        (Accelerator.V5E1, True, None),
+        (Accelerator.T4, False, None),
+    ],
+)
+def test_resolve_assign_shape(accelerator, high_mem, expected):
+    assert resolve_assign_shape(accelerator, high_mem=high_mem) == expected

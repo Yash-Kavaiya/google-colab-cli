@@ -14,6 +14,7 @@
 
 import abc
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
 import logging
@@ -21,6 +22,11 @@ from typing import Dict, List, Optional, Union
 from urllib.parse import urljoin, urlparse
 import uuid
 
+from colab_cli.consumption import (
+    CcuInfo,
+    ConsumptionUserInfo,
+    consumption_user_info_from_tunnel,
+)
 from colab_cli.utils import get_status_code
 from pydantic import BaseModel, Field, TypeAdapter
 import requests
@@ -32,16 +38,6 @@ COLAB_CLIENT_AGENT_HEADER = {
     "value": "colab-cli",
 }
 COLAB_XSRF_TOKEN_HEADER = {"key": "X-Goog-Colab-Token", "value": ""}
-# Marks a request as one that should be resolved through the Colab tunnel
-# (Tunnel Frontend). Required by TFE-intercepted paths such as the keep-alive
-# ping; without it the front-door rejects the request with HTTP 400.
-COLAB_TUNNEL_HEADER = {"key": "X-Colab-Tunnel", "value": "Google"}
-
-# Per-request timeout (seconds) for the keep-alive tunnel ping. TFE records the
-# activity as soon as the request arrives, so we do not need to wait long for
-# the (often non-responding) VM. A short timeout keeps the keep-alive daemon
-# responsive on its 60s cadence.
-KEEP_ALIVE_TIMEOUT = 10
 
 
 @dataclass
@@ -91,10 +87,47 @@ class Shape(int, Enum):
     HIGH_RAM = 1
 
 
+# Accelerators that only exist in a single (high-memory) shape; the assign
+# endpoint ignores shape=hm for these (colab-vscode forces STANDARD).
+HIGH_MEM_ONLY_ACCELERATORS = frozenset(
+    {Accelerator.L4, Accelerator.V5E1, Accelerator.V6E1}
+)
+
+
+def resolve_assign_shape(
+    accelerator: Optional[Accelerator],
+    *,
+    high_mem: bool = False,
+) -> Optional[Shape]:
+    """Map CLI intent to the shape query param for /tun/m/assign.
+
+    Returns ``Shape.HIGH_RAM`` when high memory was requested and the
+    accelerator supports a choice; otherwise ``None`` (omit the URL param).
+    """
+    if not high_mem:
+        return None
+    if accelerator in HIGH_MEM_ONLY_ACCELERATORS:
+        return None
+    return Shape.HIGH_RAM
+
+
+def shape_display_label(shape: Union[Shape, str, int, None]) -> str:
+    """Human-friendly label for sessions/status output."""
+    if shape in (Shape.HIGH_RAM, "HIGH_RAM", 1):
+        return "High-RAM"
+    return "Standard"
+
+
 class RuntimeProxyInfo(BaseModel):
     token: str
     token_expires_in_seconds: int = Field(..., alias="tokenExpiresInSeconds")
     url: str
+
+    def expires_at(self) -> datetime:
+        """Absolute expiry; call right after receiving the response."""
+        return datetime.now(timezone.utc) + timedelta(
+            seconds=self.token_expires_in_seconds
+        )
 
 
 class ListedAssignment(BaseModel):
@@ -203,12 +236,18 @@ class Client:
         body = self._strip_xssi_prefix(response.text)
         if not body:
             return
-        # Some endpoints (e.g. KeepAliveAssignment) return a non-empty body
-        # but the caller doesn't care about the response content — skip
-        # pydantic validation entirely when no schema was supplied.
+        # Some endpoints return a non-empty body but the caller doesn't care
+        # about the response content — skip pydantic validation entirely when
+        # no schema was supplied.
         if schema is None:
             return
         return TypeAdapter(schema).validate_python(json.loads(body))
+
+    def get_consumption_user_info(self) -> ConsumptionUserInfo:
+        """Fetch account-level CCU balance and usage rate from the session backend."""
+        url = urljoin(self.colab_domain, f"{TUN_ENDPOINT}/ccu-info")
+        ccu = self._issue_request(url, schema=CcuInfo)
+        return consumption_user_info_from_tunnel(ccu)
 
     def list_assignments(self) -> List[ListedAssignment]:
         url = urljoin(self.colab_domain, f"{TUN_ENDPOINT}/assignments")
@@ -228,14 +267,17 @@ class Client:
         notebook_hash: uuid.UUID,
         variant: Optional[Variant] = None,
         accelerator: Optional[Accelerator] = None,
+        shape: Optional[Shape] = None,
     ) -> Union[PostAssignmentResponse, Assignment]:
-        assignment = self._get_assignment(notebook_hash, variant, accelerator)
+        assignment = self._get_assignment(
+            notebook_hash, variant, accelerator, shape
+        )
         if isinstance(assignment, Assignment):
             return assignment
 
         try:
             res = self._post_assignment(
-                notebook_hash, assignment.token, variant, accelerator
+                notebook_hash, assignment.token, variant, accelerator, shape
             )
         except ColabRequestError as e:
             if get_status_code(e) == 412:
@@ -249,6 +291,7 @@ class Client:
         notebook_hash: uuid.UUID,
         variant: Optional[Variant] = None,
         accelerator: Optional[Accelerator] = None,
+        shape: Optional[Shape] = None,
     ) -> str:
         url = urljoin(self.colab_domain, f"{TUN_ENDPOINT}/assign")
         params = {"nbh": uuid_to_web_safe_base64(notebook_hash)}
@@ -256,6 +299,8 @@ class Client:
             params["variant"] = variant.value
         if accelerator:
             params["accelerator"] = accelerator.value
+        if shape == Shape.HIGH_RAM:
+            params["shape"] = "hm"
 
         req = requests.Request("GET", url, params=params)
         prep = req.prepare()
@@ -266,8 +311,9 @@ class Client:
         notebook_hash: uuid.UUID,
         variant: Optional[Variant] = None,
         accelerator: Optional[Accelerator] = None,
+        shape: Optional[Shape] = None,
     ) -> Union[GetAssignmentResponse, Assignment]:
-        url = self._build_assign_url(notebook_hash, variant, accelerator)
+        url = self._build_assign_url(notebook_hash, variant, accelerator, shape)
         return self._issue_request(url, schema=Union[GetAssignmentResponse, Assignment])
 
     def _post_assignment(
@@ -276,30 +322,11 @@ class Client:
         xsrf_token: str,
         variant: Optional[Variant] = None,
         accelerator: Optional[Accelerator] = None,
+        shape: Optional[Shape] = None,
     ) -> PostAssignmentResponse:
-        url = self._build_assign_url(notebook_hash, variant, accelerator)
+        url = self._build_assign_url(notebook_hash, variant, accelerator, shape)
         headers = {COLAB_XSRF_TOKEN_HEADER["key"]: xsrf_token}
         return self._issue_request(
             url, method="POST", headers=headers, schema=PostAssignmentResponse
         )
 
-    def keep_alive_assignment(self, endpoint: str):
-        """Refreshes the idle timer for the given assignment endpoint.
-
-        TFE notes the activity as soon as the request arrives, then forwards it
-        to the VM, which does not always respond on this path — so the request
-        commonly read-times-out even though the keep-alive succeeded. A read
-        timeout is therefore treated as success; only an actual HTTP error
-        response (4xx/5xx, e.g. 404 for a deleted assignment) is surfaced.
-        """
-        url = urljoin(self.colab_domain, f"{TUN_ENDPOINT}/{endpoint}/keep-alive/")
-        headers = {COLAB_TUNNEL_HEADER["key"]: COLAB_TUNNEL_HEADER["value"]}
-        try:
-            return self._issue_request(
-                url, method="GET", headers=headers, timeout=KEEP_ALIVE_TIMEOUT
-            )
-        except requests.exceptions.ReadTimeout:
-            # The activity was recorded by TFE before the request was forwarded;
-            # the VM simply didn't answer in time. This is the normal,
-            # successful case for this path.
-            return None

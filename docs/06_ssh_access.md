@@ -1,5 +1,7 @@
 ---
 log:
+2026-09-25: Cleaned up keep-alive daemon references in session creation and teardown documentation.
+2026-08-09: Added `--high-mem` passthrough when `colab ssh` auto-creates a runtime (forwards to `colab new --high-mem`).
 2026-07-17: Initial design and implementation of `colab ssh` — client side of SSH-over-WebSocket runtime access. Adds three modes (interactive shell, `-s SESSION`, and `--proxy-mode` OpenSSH ProxyCommand bridge), `--identity/-i` key selection, and per-HTTP-status handshake error messages. Server side is out of scope for this repo; the subcommand is a no-op against runtimes that do not expose the `/colab/ssh` endpoint (surfaces an actionable HTTP 404 message).
 2026-07-22: Bare `colab ssh` now auto-creates a runtime (via `colab new`) when you have no active session, with `--gpu/--tpu` passthrough and `--rm` to stop an auto-created runtime on exit. Fixed two client bugs: the dead 403 branch (feature-off returns 404, not 403) and the RSA guidance (all `ssh-rsa` keys are server-rejected, so `id_rsa` is no longer auto-scanned and the 400 message no longer advertises `rsa-sha2`). Added `tests/test_ssh_wire_contract.py` (real loopback-server wire assertions) and `tests/test_ssh_autocreate.py`.
 2026-07-22: Interactive `colab ssh` now starts in `/content` (Colab's working dir) instead of `/root`, via a forced PTY (`-t`) plus a remote `cd /content 2>/dev/null; exec $SHELL -l`. A missing `/content` falls back to the login home. Added `tests/test_ssh_workdir.py`.
@@ -30,6 +32,7 @@ colab ssh [OPTIONS]
 | `-i`, `--identity` | str | auto | Private key for the public key sent to Colab. Default: first of `~/.ssh/id_ed25519`, `id_ecdsa`. |
 | `--gpu` | str | None | GPU accelerator for a runtime this command creates (T4, L4, G4, H100, A100). |
 | `--tpu` | str | None | TPU accelerator for a runtime this command creates (v5e1, v6e1). |
+| `--high-mem` | bool | False | Request high-RAM when this command auto-creates a runtime (ignored when connecting to an existing session). |
 | `--rm` | bool | False | Stop the runtime when the session ends. Interactive: only a runtime `colab ssh` auto-created (a reused session is never removed). `--proxy-mode`: the bridged session, on disconnect. |
 
 ### `~/.ssh/config` usage
@@ -55,9 +58,8 @@ remote command, so to also land in `/content` add `RequestTTY yes` and
 1. **Session resolution / auto-create**: With `-s NAME`, resolves that session
    (via `state.resolve_session`, the same helper the other commands use). Bare
    `colab ssh` uses your only active session; with **no** session it auto-creates
-   one (mirrors `colab new` end-to-end: assign → keep-alive pre-flight → spawn
-   keep-alive daemon → persist `SessionState`); with **multiple** it errors and
-   asks you to pick one with `-s`.
+   one (mirrors `colab new`: assign → persist `SessionState`); with **multiple**
+   it errors and asks you to pick one with `-s`.
 2. **Connect**: Opens the WebSocket to `wss://<netloc>/colab/ssh?colab-runtime-proxy-token=<token>`
    and sends the resolved public key verbatim in the `X-Colab-Ssh-Pubkey` header
    (no transformation -- the bytes the user controls are exactly what the server
@@ -76,8 +78,8 @@ remote command, so to also land in `/content` add `RequestTTY yes` and
 5. **`--rm` teardown**: Stops the runtime when the session ends. In `--proxy-mode`
    this must survive how OpenSSH ends a `ProxyCommand`: on disconnect it sends
    **SIGHUP** (verified), not just stdin EOF, and Python's default SIGHUP action
-   would terminate the process before the teardown `finally` ran — leaking the
-   runtime and its keep-alive daemon. `--rm` therefore installs
+    would terminate the process before the teardown `finally` ran — leaking the
+    runtime. `--rm` therefore installs
    SIGHUP/SIGTERM/SIGINT handlers that run the stop, idempotent with the
    `finally`. `SIGKILL` cannot be intercepted, so a `kill -9`/hard crash can
    still leak; a normal disconnect is SIGHUP and is handled.

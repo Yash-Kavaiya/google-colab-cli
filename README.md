@@ -19,7 +19,7 @@ Designed to support seamless developer productivity, headless automation, and AI
 * **Instant VM Provisioning:** Spin up CPU, GPU (T4, L4, G4, H100, A100), or TPU (v5e1, v6e1) runtimes in seconds.
 * **Robust Code Execution:** Run local Python scripts, Jupyter Notebooks (`.ipynb`), or piped `stdin` code; launch interactive REPLs or raw TTY console shells.
 * **Ephemeral Job Runner (`colab run`):** Provision a fresh VM, execute a local script with forwarded arguments, retrieve output files, and automatically tear down the runtime in a single command.
-* **Automatic Keep-Alive:** Built-in background daemon automatically prevents idle VM termination, keeping resource allocations active without requiring open browser tabs.
+* **Activity-Based Liveness:** Sessions stay alive as long as the kernel is active, with the Colab backend automatically maintaining liveness.
 * **Seamless Workspace Automation:** Mount Google Drive, authenticate Google Cloud Platform (GCP) credentials, and install dependencies with high-performance `uv` package management.
 * **State & Log Archival:** Inspect local session states or export interactive history logs to standard Jupyter Notebooks, Markdown, or structured JSONL.
 
@@ -48,7 +48,7 @@ Run a CPU-based VM runtime, execute some code, and clean up:
 colab new
 
 # 2. Execute code from stdin
-echo "print('Hello from Google Colab!')" | colab exec
+echo 'print("Hello from Google Colab!")' | colab exec
 
 # 3. Stop and release the VM resource
 colab stop
@@ -68,21 +68,21 @@ Run `colab <command> --help` to view specific options, defaults, and detailed he
 ### Session Management
 | Command | Description |
 | --- | --- |
-| `colab new [-s NAME] [--gpu GPU] [--tpu TPU]` | Allocate a new CPU, GPU, or TPU VM runtime |
+| `colab new [-s NAME] [--gpu GPU] [--tpu TPU] [--high-mem]` | Allocate a new CPU, GPU, or TPU VM runtime (optionally high-RAM) |
 | `colab sessions` | List all active sessions currently active on the backend |
-| `colab status [-s NAME]` | Display hardware, status, and local metadata for active sessions |
+| `colab status [-s NAME]` | Display hardware, machine shape, status, and local metadata for active sessions |
 | `colab restart-kernel [-s NAME]` | Restart the active session's Jupyter kernel |
-| `colab stop [-s NAME]` | Terminate a session VM and tear down its keep-alive daemon |
+| `colab stop [-s NAME]` | Terminate a session VM and release its resources |
 | `colab url [-s NAME] [--open]` | Print or open a browser URL connecting to the active session |
 
 ### Execution
 | Command | Description |
 | --- | --- |
-| `colab run [--gpu GPU] [--tpu TPU] [--keep] SCRIPT [ARGS...]` | Run a local script on a fresh VM, forwarding arguments, then release it |
+| `colab run [--gpu GPU] [--tpu TPU] [--high-mem] [--keep] SCRIPT [ARGS...]` | Run a local script on a fresh VM, forwarding arguments, then release it |
 | `colab exec [-s NAME] [-f FILE] [--output-image PATH]` | Execute Python code from stdin, a local `.py` file, or a `.ipynb` notebook |
 | `colab repl [-s NAME] [--output-image PATH]` | Start an interactive Python REPL on the VM (exits cleanly on piped EOF) |
 | `colab console [-s NAME]` | Connect to a raw interactive TTY shell (tmux) on the remote VM |
-| `colab ssh [-s NAME] [--proxy-mode] [-i KEY]` | Open an SSH shell to the runtime over WebSocket, or act as an OpenSSH `ProxyCommand` bridge for IDE remote-dev |
+| `colab ssh [-s NAME] [--proxy-mode] [-i KEY] [--gpu GPU] [--tpu TPU] [--high-mem]` | Open an SSH shell to the runtime over WebSocket, or act as an OpenSSH `ProxyCommand` bridge for IDE remote-dev |
 
 ### File Operations
 | Command | Description |
@@ -100,6 +100,7 @@ Run `colab <command> --help` to view specific options, defaults, and detailed he
 | `colab drivemount [-s NAME] [PATH]` | Mount Google Drive on the VM (default: `/content/drive`) |
 | `colab install [-s NAME] [-r FILE \| PKG...]` | Install packages on the VM using `uv` (falls back to `pip`) |
 | `colab log [-s NAME] [-n N] [-o FILE]` | View or export session history (`.ipynb`, `.md`, `.txt`, `.jsonl`) |
+| `colab usage` | Show account compute-unit usage rate and balance |
 | `colab pay` | Open the Colab subscription page to manage compute units |
 | `colab version` | Print the installed version of the CLI |
 | `colab update [--install]` | Check for a newer release (and optionally upgrade the CLI in place) |
@@ -142,6 +143,7 @@ colab stop -s analysis
 
 ## Usage Notes
 
+* **Machine shape:** Use `--high-mem` with `colab new`, `colab run`, or `colab ssh` (when auto-creating a runtime) to request a high-RAM machine shape. Requires Colab Pro or Pro+ entitlement for supported accelerators (CPU, T4, A100, etc.). L4 and TPU runtimes ignore this flag because they only offer one shape. Machine shape is shown in `colab sessions` and `colab status`.
 * **TTY Requirements:** The interactive commands `repl` and `console` require a local TTY. When running inside automated scripts or pipelines, make sure to pipe stdin (e.g., `echo "print(1)" | colab repl`) to trigger non-interactive execution modes.
 * **Transparent Code Execution:** When calling `colab exec -f file.py`, the CLI reads the file locally and transmits its content to the remote kernel. You do not need to manually upload files before execution.
 * **Storage & State Paths:** Session tokens and metadata are stored at `~/.config/colab-cli/sessions.json`. Global CLI settings are located at `~/.config/colab-cli/settings.json`. These can be customized or isolated via the global `--config` flag.
@@ -175,7 +177,7 @@ Make the script executable (`chmod +x script.py`) and run it: `./script.py`. The
 
 For comprehensive architectural overviews and deep-dives into specific CLI sub-systems, refer to the detailed documentation:
 
-* [Session Management & Keep-Alive Architecture](docs/01_session_management.md)
+* [Session Management Architecture](docs/01_session_management.md)
 * [Interactive & Non-Interactive Execution Design](docs/02_execution_and_interactive.md)
 * [File Management & Jupyter Contents API](docs/03_file_management.md)
 * [Authentication Providers & VM Automation](docs/04_automation_and_utility.md)

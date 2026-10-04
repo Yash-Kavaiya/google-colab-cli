@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,7 +24,10 @@ from colab_cli.client import (
     Assignment,
     ColabRequestError,
     PostAssignmentResponse,
+    RuntimeProxyInfo,
+    TooManyAssignmentsError,
 )
+from colab_cli.consumption import ConsumptionUserInfo
 
 runner = CliRunner()
 
@@ -46,8 +50,9 @@ def mock_history(mock_common_state):
 def test_cli_new_tpu(mock_client, mock_store):
     mock_res = MagicMock()
     mock_res.__class__ = PostAssignmentResponse
-    mock_res.runtime_proxy_info.token = "t1"
-    mock_res.runtime_proxy_info.url = "u1"
+    mock_res.runtime_proxy_info = RuntimeProxyInfo(
+        token="t1", tokenExpiresInSeconds=3600, url="u1"
+    )
     mock_res.endpoint = "e1"
     mock_client.assign.return_value = mock_res
 
@@ -58,6 +63,9 @@ def test_cli_new_tpu(mock_client, mock_store):
     assert added_state.name == "my-session"
     assert added_state.variant == "TPU"
     assert added_state.accelerator == "V5E1"
+    assert added_state.token_expires_at > datetime.now(timezone.utc) + timedelta(
+        minutes=55
+    )
 
 
 def test_cli_new_gpu(mock_client, mock_store):
@@ -104,12 +112,13 @@ def test_cli_new_gpu_variants(mock_client, mock_store, gpu_flag, expected_acc):
 
 def test_cli_sessions_unified_format(mock_client, mock_common_state):
     """`sessions` should lead each line with the local name when known:
-    `[name] endpoint | Hardware: X | Variant: Y`.
+    `[name] endpoint | Hardware: X | Shape: Y | Variant: Z`.
     """
     mock_assignment = MagicMock()
     mock_assignment.endpoint = "e1"
     mock_assignment.variant.name = "GPU"
     mock_assignment.accelerator.value = "T4"
+    mock_assignment.machine_shape.name = "STANDARD"
 
     mock_session_state = MagicMock()
     mock_session_state.name = "s1"
@@ -123,7 +132,7 @@ def test_cli_sessions_unified_format(mock_client, mock_common_state):
 
     result = runner.invoke(app, ["sessions"])
     assert result.exit_code == 0
-    assert "[s1] e1 | Hardware: T4 | Variant: GPU" in result.output
+    assert "[s1] e1 | Hardware: T4 | Shape: Standard | Variant: GPU" in result.output
 
 
 def test_cli_sessions_orphaned_assignment_marked(mock_client, mock_common_state):
@@ -132,13 +141,17 @@ def test_cli_sessions_orphaned_assignment_marked(mock_client, mock_common_state)
     mock_assignment.endpoint = "orphan-ep"
     mock_assignment.variant.name = "DEFAULT"
     mock_assignment.accelerator.value = "NONE"
+    mock_assignment.machine_shape.name = "HIGH_RAM"
 
     mock_common_state.sync_sessions.return_value = ({}, [mock_assignment])
 
     result = runner.invoke(app, ["sessions"])
     assert result.exit_code == 0
     # CPU is the alias for accelerator NONE
-    assert "[?] orphan-ep | Hardware: CPU | Variant: DEFAULT" in result.output
+    assert (
+        "[?] orphan-ep | Hardware: CPU | Shape: High-RAM | Variant: DEFAULT"
+        in result.output
+    )
 
 
 def test_cli_sessions_no_assignments(mock_client, mock_common_state):
@@ -154,6 +167,7 @@ def test_cli_status(mock_store, mock_common_state):
     mock_session_state.endpoint = "e1"
     mock_session_state.accelerator = "NONE"
     mock_session_state.variant = "DEFAULT"
+    mock_session_state.machine_shape = "STANDARD"
     mock_session_state.running = None
     mock_session_state.last_execution = (
         "my_notebook.ipynb",
@@ -167,11 +181,15 @@ def test_cli_status(mock_store, mock_common_state):
     # Test with explicit session: uses unified format including endpoint and Status
     result = runner.invoke(app, ["status", "-s", "s1"])
     assert result.exit_code == 0
-    assert "[s1] e1 | Hardware: CPU | Variant: DEFAULT | Status: IDLE" in result.output
+    assert (
+        "[s1] e1 | Hardware: CPU | Shape: Standard | Variant: DEFAULT | Status: IDLE"
+        in result.output
+    )
     assert (
         "Last Execution: my_notebook.ipynb | Cell: cell_1 at 2023-10-27 12:00:00"
         in result.output
     )
+    assert "0.07/hr" not in result.output
     mock_store.get.assert_called_with("s1")
 
     # Test with missing session
@@ -184,7 +202,10 @@ def test_cli_status(mock_store, mock_common_state):
     mock_store.get.return_value = mock_session_state
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
-    assert "[s1] e1 | Hardware: CPU | Variant: DEFAULT | Status: IDLE" in result.output
+    assert (
+        "[s1] e1 | Hardware: CPU | Shape: Standard | Variant: DEFAULT | Status: IDLE"
+        in result.output
+    )
 
     # Test without execution metadata
     mock_session_state.last_execution = None
@@ -200,6 +221,7 @@ def test_cli_status_running_shows_busy(mock_store, mock_common_state):
     mock_session_state.endpoint = "e1"
     mock_session_state.accelerator = "T4"
     mock_session_state.variant = "GPU"
+    mock_session_state.machine_shape = "STANDARD"
     mock_session_state.running = "exec.py"
     mock_session_state.last_execution = None
     mock_store.get.return_value = mock_session_state
@@ -208,9 +230,57 @@ def test_cli_status_running_shows_busy(mock_store, mock_common_state):
     result = runner.invoke(app, ["status", "-s", "s1"])
     assert result.exit_code == 0
     assert (
-        "[s1] e1 | Hardware: T4 | Variant: GPU | Status: BUSY (exec.py)"
+        "[s1] e1 | Hardware: T4 | Shape: Standard | Variant: GPU | Status: BUSY (exec.py)"
         in result.output
     )
+
+
+def _mock_consumption_info(mock_common_state):
+    mock_common_state.client.get_consumption_user_info.return_value = (
+        ConsumptionUserInfo(
+            paid_compute_units_balance=123.45,
+            consumption_rate_hourly=0.07,
+            assignments_count=1,
+        )
+    )
+
+
+def test_cli_usage(mock_common_state):
+    _mock_consumption_info(mock_common_state)
+    result = runner.invoke(app, ["usage"])
+    assert result.exit_code == 0
+    assert "0.07/hr" in result.output
+    assert "Current balance: 123.45 compute units" in result.output
+
+
+def test_cli_usage_fetch_failure(mock_common_state):
+    mock_common_state.client.get_consumption_user_info.side_effect = RuntimeError(
+        "network down"
+    )
+    result = runner.invoke(app, ["usage"])
+    assert result.exit_code == 1
+    assert "failed to fetch compute-unit info" in result.output
+
+
+def test_cli_new_high_mem(mock_client, mock_store):
+    mock_res = MagicMock()
+    mock_res.__class__ = PostAssignmentResponse
+    mock_res.runtime_proxy_info.token = "t1"
+    mock_res.runtime_proxy_info.url = "u1"
+    mock_res.endpoint = "e1"
+    mock_client.assign.return_value = mock_res
+
+    result = runner.invoke(app, ["new", "-s", "hm-sess", "--gpu", "A100", "--high-mem"])
+    assert result.exit_code == 0
+
+    mock_client.assign.assert_called_once()
+    _, kwargs = mock_client.assign.call_args
+    from colab_cli.client import Shape
+
+    assert kwargs["shape"] == Shape.HIGH_RAM
+
+    added_state = mock_store.add.call_args[0][0]
+    assert added_state.machine_shape == "HIGH_RAM"
 
 
 def test_cli_session_resolution(mock_store, mock_common_state):
@@ -562,4 +632,28 @@ def test_cli_new_non_400_error_propagates(mock_client, mock_store):
     assert result.exit_code != 0
     # Should not present the 400-specific friendly text
     assert "quota" not in result.output.lower()
+    mock_store.add.assert_not_called()
+
+
+def test_cli_new_412_with_gpu_shows_friendly_error(mock_client, mock_store):
+    """A 412 from `assign` (TooManyAssignmentsError) should surface a
+    friendly message and exit non-zero, NOT raise a traceback."""
+    mock_client.assign.side_effect = TooManyAssignmentsError("Precondition Failed")
+
+    result = runner.invoke(app, ["new", "--gpu", "T4"])
+
+    assert result.exit_code != 0
+    assert "precondition" in result.output.lower()
+    mock_store.add.assert_not_called()
+
+
+def test_cli_new_412_without_accelerator_shows_friendly_error(mock_client, mock_store):
+    """The 412 handling also applies to a plain CPU request, since it can
+    mean too many active sessions rather than an accelerator problem."""
+    mock_client.assign.side_effect = TooManyAssignmentsError("Precondition Failed")
+
+    result = runner.invoke(app, ["new"])
+
+    assert result.exit_code != 0
+    assert "precondition" in result.output.lower()
     mock_store.add.assert_not_called()

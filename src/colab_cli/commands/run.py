@@ -41,39 +41,16 @@ from typing_extensions import Annotated
 from colab_cli.client import (
     Accelerator,
     ColabRequestError,
+    HIGH_MEM_ONLY_ACCELERATORS,
     PostAssignmentResponse,
-    Variant,
+    Shape,
+    TooManyAssignmentsError,
 )
 from colab_cli.commands.execution import _build_env_prelude, _parse_env_vars
-from colab_cli.commands.session import (
-    _is_scope_error,
-    _scope_remediation_message,
-    spawn_keep_alive,
-)
+from colab_cli.commands.session import resolve_runtime_options
 from colab_cli.runtime import ColabRuntime
 from colab_cli.state import SessionState
 from colab_cli.utils import get_status_code, is_terminal_error
-
-
-# TODO(sethtroisi): dedupe this logic with similar in session.py
-def _resolve_accelerator(gpu: Optional[str], tpu: Optional[str]):
-    """Mirror the mapping logic in `commands.session.new`. Centralised so the
-    two commands stay in lock-step on supported accelerator names.
-    """
-    if tpu:
-        variant = Variant.TPU
-        accelerator = Accelerator.V5E1 if tpu.lower() == "v5e1" else Accelerator.V6E1
-        return variant, accelerator
-    if gpu:
-        mapping = {
-            "a100": Accelerator.A100,
-            "h100": Accelerator.H100,
-            "l4": Accelerator.L4,
-            "t4": Accelerator.T4,
-            "g4": Accelerator.G4,
-        }
-        return Variant.GPU, mapping.get(gpu.lower(), Accelerator.A100)
-    return Variant.DEFAULT, Accelerator.NONE
 
 
 def _build_script_payload(
@@ -259,6 +236,16 @@ def run_command(
             ),
         ),
     ] = None,
+    high_mem: Annotated[
+        bool,
+        typer.Option(
+            "--high-mem",
+            help=(
+                "Request a high-RAM machine shape. Requires Colab Pro or Pro+ "
+                "entitlement. Ignored for L4 and TPU accelerators."
+            ),
+        ),
+    ] = False,
     keep: Annotated[
         bool,
         typer.Option(
@@ -306,13 +293,32 @@ def run_command(
         raise typer.Exit(2)
 
     name = session or f"run-{uuid.uuid4().hex[:6]}"
-    variant, accelerator = _resolve_accelerator(gpu, tpu)
+    variant, accelerator, shape = resolve_runtime_options(
+        gpu, tpu, high_mem=high_mem
+    )
+
+    if high_mem and accelerator in HIGH_MEM_ONLY_ACCELERATORS:
+        typer.echo(
+            "[colab] --high-mem ignored: this accelerator only offers one "
+            "machine shape.",
+            err=True,
+        )
 
     typer.echo(f"[colab] Creating session '{name}'...", err=True)
     try:
         res = state.client.assign(
-            uuid.uuid4(), variant=variant, accelerator=accelerator
+            uuid.uuid4(), variant=variant, accelerator=accelerator, shape=shape
         )
+    except TooManyAssignmentsError:
+        # Mirror `colab new`'s friendly precondition-failed message.
+        typer.echo(
+            "[colab] Allocation refused (precondition failed). This can mean "
+            "too many active sessions, or a temporary usage or capacity "
+            "limit for the requested runtime. Run `colab stop` to free up a "
+            "session, wait and retry, or try a different accelerator.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     except ColabRequestError as e:
         # Mirror `colab new`'s friendly accelerator-quota message.
         if get_status_code(e) == 400 and accelerator != Accelerator.NONE:
@@ -344,38 +350,18 @@ def run_command(
         token=token,
         url=url,
         endpoint=endpoint,
+        token_expires_at=(
+            res.runtime_proxy_info.expires_at()
+            if hasattr(res, "runtime_proxy_info")
+            else None
+        ),
         variant=variant.value,
         accelerator=accelerator.value,
+        machine_shape=(
+            Shape.HIGH_RAM.name if shape == Shape.HIGH_RAM else Shape.STANDARD.name
+        ),
     )
 
-    # Pre-flight keep-alive: same scope-detection dance as `colab new` so a
-    # missing OAuth scope doesn't leak a billable assignment.
-    try:
-        state.client.keep_alive_assignment(endpoint)
-    except ColabRequestError as e:
-        if get_status_code(e) == 403 and _is_scope_error(e):
-            typer.echo(
-                "[colab] Keep-alive pre-flight failed: your credentials "
-                "are missing an OAuth scope required by Colab.\n",
-                err=True,
-            )
-            typer.echo(_scope_remediation_message(state.auth_provider), err=True)
-            try:
-                state.client.unassign(endpoint)
-            except Exception:
-                pass
-            raise typer.Exit(code=1)
-        # Other failures: don't block — the daemon will retry.
-
-    # AGENTS.md item 17: persist BEFORE spawning the daemon so the daemon's
-    # initial state.store.get(name) doesn't race the parent.
-    state.store.add(s)
-    s.keep_alive_pid = spawn_keep_alive(
-        endpoint,
-        name,
-        auth_provider=state.auth_provider,
-        config_path=state.config_path,
-    )
     state.store.add(s)
     state.history.log_event(
         name,
@@ -384,6 +370,7 @@ def run_command(
             "endpoint": endpoint,
             "variant": variant.value,
             "accelerator": accelerator.value,
+            "machine_shape": s.machine_shape,
             "via": "run",
         },
     )
@@ -472,25 +459,22 @@ def run_command(
 
 
 def _teardown(name: str, s: SessionState, *, reason: str) -> None:
-    """Best-effort full session teardown: kill the keep-alive daemon, ask the
-    remote kernel to shut down, unassign the VM, and remove local state.
+    """Best-effort full session teardown: ask the remote kernel to shut down,
+    unassign the VM, and remove local state.
 
     Mirrors `commands.session.stop` but with a richer history event reason and
     swallowing all errors (we don't want a teardown failure to mask the user's
     exit code).
     """
-    from colab_cli.common import kill_process, state
+    from colab_cli.common import state
 
     typer.echo(f"[colab] Stopping session '{name}'...", err=True)
-    if s.keep_alive_pid:
-        try:
-            kill_process(s.keep_alive_pid)
-        except Exception:
-            pass
-
     try:
-        rt = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
-        rt.stop(shutdown_kernel=True)
+        # The script may have outlived the proxy token.
+        fresh = state.get_session(name, ignore_missing_session=True)
+        if fresh:
+            rt = ColabRuntime(fresh.url, fresh.token, kernel_id=fresh.kernel_id)
+            rt.stop(shutdown_kernel=True)
     except Exception:
         pass
 
